@@ -1,4 +1,3 @@
-
 import pandas as pd
 import numpy as np
 import os
@@ -20,6 +19,11 @@ from models.lstm_model import LSTMPredictor
 from models.lgbm_model import LightGBMPredictor
 from models.ensemble import EnsemblePredictor
 
+# Set random seeds for reproducibility
+np.random.seed(42)
+import tensorflow as tf
+tf.random.set_seed(42)
+
 def create_directories():
     """Create necessary directories"""
     dirs = [
@@ -38,14 +42,8 @@ def create_directories():
 
 def load_and_prepare_data(symbol, period='2y'):
     """
-    Load and prepare data for training
-    
-    Args:
-        symbol: Stock symbol
-        period: Time period
-        
-    Returns:
-        Processed DataFrame
+    Load data WITHOUT normalization
+    Normalization will be done AFTER train/test split
     """
     print(f"\n{'='*80}")
     print(f"LOADING AND PREPARING DATA FOR {symbol}")
@@ -64,103 +62,176 @@ def load_and_prepare_data(symbol, period='2y'):
         if df is not None and not df.empty:
             loader.save_data(df, symbol)
         else:
-            raise ValueError(f"No data available for symbol {symbol}. Please check the symbol or try a different one.")
+            raise ValueError(f"No data available for symbol {symbol}")
     
-    # Engineer features
+    # Create features WITHOUT normalization
     engineer = FeatureEngineer()
-    features_df = engineer.engineer_features(df, n_lags=5, horizon=1, normalize=True)
+    features_df = engineer.create_features(df, n_lags=5, horizon=1)
     
-    # Save features
-    engineer.save_features(features_df, symbol)
+    print(f"✓ Features created: {len(features_df)} samples, {len(features_df.columns)} features")
     
     return features_df, engineer
 
 def split_data(df, train_ratio=0.7, val_ratio=0.15):
     """
     Split data into train, validation, and test sets
-    
-    Args:
-        df: DataFrame
-        train_ratio: Training data ratio
-        val_ratio: Validation data ratio
-        
-    Returns:
-        train_df, val_df, test_df
+    CRITICAL: This must be done BEFORE normalization
     """
     n = len(df)
     train_end = int(n * train_ratio)
     val_end = int(n * (train_ratio + val_ratio))
     
-    train_df = df[:train_end]
-    val_df = df[train_end:val_end]
-    test_df = df[val_end:]
+    train_df = df[:train_end].copy()
+    val_df = df[train_end:val_end].copy()
+    test_df = df[val_end:].copy()
     
-    print(f"\n✓ Data split:")
+    print(f"\n✓ Data split (BEFORE normalization):")
     print(f"  Training: {len(train_df)} samples ({train_ratio*100:.0f}%)")
     print(f"  Validation: {len(val_df)} samples ({val_ratio*100:.0f}%)")
     print(f"  Testing: {len(test_df)} samples ({(1-train_ratio-val_ratio)*100:.0f}%)")
     
     return train_df, val_df, test_df
 
-def train_arima(train_df, test_df, symbol):
-    """Train ARIMA model"""
+def normalize_splits(train_df, val_df, test_df, engineer):
+    """
+    Normalize data AFTER splitting
+    Fit scalers on training data only
+    """
+    print(f"\n{'='*80}")
+    print("NORMALIZING DATA (No Data Leakage)")
+    print(f"{'='*80}")
+    
+    # Fit scalers on training data only
+    engineer.fit_scalers(train_df)
+    
+    # Transform all splits using training scalers
+    train_scaled = engineer.transform_features(train_df)
+    val_scaled = engineer.transform_features(val_df)
+    test_scaled = engineer.transform_features(test_df)
+    
+    print("✓ All splits normalized using training statistics only")
+    
+    return train_scaled, val_scaled, test_scaled
+
+def prepare_model_data(train_df, val_df, test_df, feature_cols):
+    """Prepare X, y for supervised models"""
+    X_train = train_df[feature_cols]
+    y_train = train_df['Target']
+    
+    X_val = val_df[feature_cols]
+    y_val = val_df['Target']
+    
+    X_test = test_df[feature_cols]
+    y_test = test_df['Target']
+    
+    return X_train, y_train, X_val, y_val, X_test, y_test
+
+def train_arima(train_df, test_df, engineer, symbol):
+    """
+    Train ARIMA model on ORIGINAL scale
+    """
     print(f"\n{'='*80}")
     print(f"TRAINING ARIMA MODEL")
     print(f"{'='*80}")
     
-    # Get price series
-    train_series = train_df['Close']
-    test_series = test_df['Close']
+    # ARIMA works on original scale, not normalized
+    # Use the non-normalized target
+    train_series = train_df['Target']
+    test_series = test_df['Target']
     
     # Train
     arima = ARIMAPredictor()
     metrics, predictions = arima.evaluate(train_series, test_series)
     
+    # Predictions are already in original scale
+    predictions_original = predictions
+    
     # Save model
     arima.save_model(f'models/saved_models/arima_models/{symbol}_arima.pkl')
     
-    return metrics, predictions
+    print(f"✓ ARIMA trained and evaluated")
+    print(f"  RMSE: {metrics['RMSE']:.4f}")
+    print(f"  MAE: {metrics['MAE']:.4f}")
+    print(f"  R²: {metrics['R2']:.4f}")
+    
+    return metrics, predictions_original
 
-def train_linear_regression(train_df, val_df, test_df, symbol):
+def train_linear_regression(train_df, val_df, test_df, engineer, symbol):
     """Train Linear Regression model"""
     print(f"\n{'='*80}")
     print(f"TRAINING LINEAR REGRESSION MODEL")
     print(f"{'='*80}")
     
-    # Initialize
-    lr = LinearPredictor()
+    # Get feature names (exclude Target)
+    feature_cols = [col for col in train_df.columns if col != 'Target']
     
     # Prepare data
-    X_train, y_train = lr.prepare_data(train_df)
-    X_val, y_val = lr.prepare_data(val_df)
-    X_test, y_test = lr.prepare_data(test_df)
+    X_train, y_train, X_val, y_val, X_test, y_test = prepare_model_data(
+        train_df, val_df, test_df, feature_cols
+    )
     
-    # Train
-    lr.train(X_train, y_train, tune_hyperparameters=True)
+    # Initialize and train
+    lr = LinearPredictor()
+    lr.feature_cols = feature_cols
+    lr.train(X_train, y_train)
     
-    # Evaluate
-    metrics, predictions = lr.evaluate(X_test, y_test)
+    # Evaluate on normalized scale
+    metrics_normalized, predictions_normalized = lr.evaluate(X_test, y_test)
+    
+    # Convert predictions back to original scale
+    predictions_original = engineer.inverse_transform_target(predictions_normalized)
+    y_test_original = engineer.inverse_transform_target(y_test.values)
+    
+    # Calculate metrics on original scale
+    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+    mse = mean_squared_error(y_test_original, predictions_original)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_test_original, predictions_original)
+    r2 = r2_score(y_test_original, predictions_original)
+    mape = np.mean(np.abs((y_test_original - predictions_original) / y_test_original)) * 100
+    
+    metrics = {
+        'MSE': mse,
+        'RMSE': rmse,
+        'MAE': mae,
+        'R2': r2,
+        'MAPE': mape
+    }
     
     # Save model
     lr.save_model(f'models/saved_models/lr_model_{symbol}.pkl')
     
-    return metrics, predictions, (X_train, y_train, X_val, y_val, X_test, y_test)
+    print(f"✓ Linear Regression trained and evaluated")
+    print(f"  RMSE: {metrics['RMSE']:.4f}")
+    print(f"  MAE: {metrics['MAE']:.4f}")
+    print(f"  R²: {metrics['R2']:.4f}")
+    
+    return metrics, predictions_original, (X_train, y_train, X_val, y_val, X_test, y_test)
 
-def train_lstm(train_df, val_df, test_df, symbol):
-    """Train LSTM model"""
+def train_lstm(train_df, val_df, test_df, engineer, symbol):
+    """Train LSTM model using ALL features"""
     print(f"\n{'='*80}")
     print(f"TRAINING LSTM MODEL")
     print(f"{'='*80}")
     
-    # Initialize
-    lstm = LSTMPredictor(sequence_length=10, units=50, layers=3, dropout=0.2)
+    # Get feature columns
+    feature_cols = [col for col in train_df.columns if col != 'Target']
     
-    # Prepare sequences
-    X_train, y_train = lstm.prepare_sequences(train_df)
-    X_val, y_val = lstm.prepare_sequences(val_df)
-    X_test, y_test = lstm.prepare_sequences(test_df)
+    # Initialize with proper settings
+    lstm = LSTMPredictor(
+        sequence_length=10, 
+        units=50, 
+        layers=2,  # Reduced from 3
+        dropout=0.2,
+        n_features=len(feature_cols)  # Pass number of features
+    )
     
-    print(f"Sequences prepared:")
+    # Prepare sequences using ALL features
+    X_train, y_train = lstm.prepare_sequences(train_df, feature_cols)
+    X_val, y_val = lstm.prepare_sequences(val_df, feature_cols)
+    X_test, y_test = lstm.prepare_sequences(test_df, feature_cols)
+    
+    print(f"✓ Sequences prepared:")
     print(f"  Train: {X_train.shape}")
     print(f"  Val: {X_val.shape}")
     print(f"  Test: {X_test.shape}")
@@ -169,103 +240,137 @@ def train_lstm(train_df, val_df, test_df, symbol):
     history = lstm.train(
         X_train, y_train,
         X_val, y_val,
-        epochs=100,
+        epochs=50,  # Reduced for faster training
         batch_size=32,
         model_path=f'models/saved_models/lstm_model_{symbol}.h5'
     )
     
-    # Evaluate
-    metrics, predictions = lstm.evaluate(X_test, y_test)
+    # Evaluate on normalized scale
+    metrics_normalized, predictions_normalized = lstm.evaluate(X_test, y_test)
     
-    return metrics, predictions, (X_train, y_train, X_val, y_val, X_test, y_test)
+    # Convert to original scale
+    predictions_original = engineer.inverse_transform_target(predictions_normalized)
+    y_test_original = engineer.inverse_transform_target(y_test)
+    
+    # Calculate metrics on original scale
+    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+    mse = mean_squared_error(y_test_original, predictions_original)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_test_original, predictions_original)
+    r2 = r2_score(y_test_original, predictions_original)
+    mape = np.mean(np.abs((y_test_original - predictions_original) / y_test_original)) * 100
+    
+    metrics = {
+        'MSE': mse,
+        'RMSE': rmse,
+        'MAE': mae,
+        'R2': r2,
+        'MAPE': mape
+    }
+    
+    print(f"✓ LSTM trained and evaluated")
+    print(f"  RMSE: {metrics['RMSE']:.4f}")
+    print(f"  MAE: {metrics['MAE']:.4f}")
+    print(f"  R²: {metrics['R2']:.4f}")
+    
+    return metrics, predictions_original
 
-def train_lightgbm(train_df, val_df, test_df, X_train, y_train, X_val, y_val, X_test, y_test, symbol):
+def train_lightgbm(train_df, val_df, test_df, engineer, symbol):
     """Train LightGBM model"""
     print(f"\n{'='*80}")
     print(f"TRAINING LIGHTGBM MODEL")
     print(f"{'='*80}")
     
-    # Initialize
-    lgbm = LightGBMPredictor()
+    # Get features
+    feature_cols = [col for col in train_df.columns if col != 'Target']
     
-    # Train
-    lgbm.train(X_train, y_train, X_val, y_val, num_boost_round=1000, early_stopping_rounds=50)
+    # Prepare data
+    X_train, y_train, X_val, y_val, X_test, y_test = prepare_model_data(
+        train_df, val_df, test_df, feature_cols
+    )
+    
+    # Initialize and train
+    lgbm = LightGBMPredictor()
+    lgbm.train(X_train, y_train, X_val, y_val, 
+               num_boost_round=500, early_stopping_rounds=50)
     
     # Evaluate
-    metrics, predictions = lgbm.evaluate(X_test, y_test)
+    metrics_normalized, predictions_normalized = lgbm.evaluate(X_test, y_test)
+    
+    # Convert to original scale
+    predictions_original = engineer.inverse_transform_target(predictions_normalized)
+    y_test_original = engineer.inverse_transform_target(y_test.values)
+    
+    # Calculate metrics on original scale
+    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+    mse = mean_squared_error(y_test_original, predictions_original)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_test_original, predictions_original)
+    r2 = r2_score(y_test_original, predictions_original)
+    mape = np.mean(np.abs((y_test_original - predictions_original) / y_test_original)) * 100
+    
+    metrics = {
+        'MSE': mse,
+        'RMSE': rmse,
+        'MAE': mae,
+        'R2': r2,
+        'MAPE': mape
+    }
     
     # Save model
     lgbm.save_model(f'models/saved_models/lgbm_model_{symbol}.pkl')
     
-    return metrics, predictions
-
-def train_ensemble(arima_preds, lr_preds, lstm_preds, lgbm_preds, y_test, symbol):
-    """Train Ensemble meta-learner"""
-    print(f"\n{'='*80}")
-    print(f"TRAINING ENSEMBLE META-LEARNER")
-    print(f"{'='*80}")
-
-    # Ensure all predictions have the same length
-    min_len = min(len(arima_preds), len(lr_preds), len(lstm_preds), len(lgbm_preds), len(y_test))
-    arima_preds = arima_preds[:min_len]
-    lr_preds = lr_preds[:min_len]
-    lstm_preds = lstm_preds[:min_len]
-    lgbm_preds = lgbm_preds[:min_len]
-    y_test = y_test[:min_len]
-
-    # Stack base predictions
-    base_predictions = np.column_stack([arima_preds, lr_preds, lstm_preds, lgbm_preds])
-
-    # Split for meta-learner training
-    train_size = int(len(base_predictions) * 0.7)
-
-    train_preds = base_predictions[:train_size]
-    test_preds = base_predictions[train_size:]
-    y_train_meta = y_test[:train_size]
-    y_test_meta = y_test[train_size:]
-
-    # Initialize ensemble
-    ensemble = EnsemblePredictor(meta_model_type='ridge')
-    ensemble.base_model_names = ['ARIMA', 'Linear Regression', 'LSTM', 'LightGBM']
-
-    # Train
-    ensemble.train_meta_learner(train_preds, y_train_meta)
-
-    # Evaluate
-    metrics, ensemble_preds = ensemble.evaluate(test_preds, y_test_meta)
-
-    # Save
-    ensemble.save_model(f'models/saved_models/meta_learner_{symbol}.pkl')
-
-    return metrics, ensemble_preds
-
-def save_all_predictions(y_test, predictions_dict, symbol):
-    """Save all predictions to CSV"""
-    results_df = pd.DataFrame({
-        'Actual': y_test,
-        'ARIMA': predictions_dict['ARIMA'],
-        'Linear_Regression': predictions_dict['Linear Regression'],
-        'LSTM': predictions_dict['LSTM'],
-        'LightGBM': predictions_dict['LightGBM'],
-        'Ensemble': predictions_dict['Ensemble']
-    })
+    print(f"✓ LightGBM trained and evaluated")
+    print(f"  RMSE: {metrics['RMSE']:.4f}")
+    print(f"  MAE: {metrics['MAE']:.4f}")
+    print(f"  R²: {metrics['R2']:.4f}")
     
-    filepath = f'data/predictions/{symbol}_predictions.csv'
-    results_df.to_csv(filepath, index=False)
-    print(f"\n✓ All predictions saved to {filepath}")
+    return metrics, predictions_original
+
+def create_baseline(test_df, engineer):
+    """
+    Create a simple baseline: tomorrow's price = today's price
+    This is the minimum performance any model should beat
+    """
+    # Get actual prices
+    y_test_original = engineer.inverse_transform_target(test_df['Target'].values)
+    
+    # Baseline: use previous day's target (shifted by 1)
+    baseline_preds = test_df['Target'].shift(1).fillna(method='bfill').values
+    baseline_preds = engineer.inverse_transform_target(baseline_preds)
+    
+    # Calculate metrics
+    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+    mse = mean_squared_error(y_test_original, baseline_preds)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_test_original, baseline_preds)
+    r2 = r2_score(y_test_original, baseline_preds)
+    mape = np.mean(np.abs((y_test_original - baseline_preds) / y_test_original)) * 100
+    
+    metrics = {
+        'MSE': mse,
+        'RMSE': rmse,
+        'MAE': mae,
+        'R2': r2,
+        'MAPE': mape
+    }
+    
+    return metrics, baseline_preds
 
 def main(symbol='AAPL', period='2y'):
     """
-    Main training pipeline
-    
-    Args:
-        symbol: Stock symbol to train on
-        period: Time period for data
+    CORRECTED training pipeline
+    Key changes:
+    1. Create features BEFORE splitting
+    2. Split data BEFORE normalization
+    3. Fit scalers on training data only
+    4. All models work on same scale (original)
+    5. Added baseline comparison
     """
     start_time = datetime.now()
     
     print(f"\n{'#'*80}")
-    print(f"# STOCK PRICE PREDICTION - MODEL TRAINING PIPELINE")
+    print(f"# CORRECTED STOCK PRICE PREDICTION PIPELINE")
     print(f"# Symbol: {symbol}")
     print(f"# Period: {period}")
     print(f"# Start time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -274,98 +379,79 @@ def main(symbol='AAPL', period='2y'):
     # Create directories
     create_directories()
     
-    # Load and prepare data
+    # Step 1: Load and create features (NO normalization yet)
     features_df, engineer = load_and_prepare_data(symbol, period)
     
-    # Split data
-    train_df, val_df, test_df = split_data(features_df)
+    # Step 2: Split data BEFORE normalization (CRITICAL)
+    train_df_raw, val_df_raw, test_df_raw = split_data(features_df)
     
-    # Store all predictions
+    # Step 3: Normalize using training statistics only
+    train_df, val_df, test_df = normalize_splits(
+        train_df_raw, val_df_raw, test_df_raw, engineer
+    )
+    
+    # Store all predictions and metrics
     all_predictions = {}
     all_metrics = {}
     
-    # 1. Train ARIMA
+    # Create baseline
+    print(f"\n{'='*80}")
+    print("CREATING BASELINE (Tomorrow = Today)")
+    print(f"{'='*80}")
+    baseline_metrics, baseline_preds = create_baseline(test_df, engineer)
+    all_metrics['Baseline'] = baseline_metrics
+    all_predictions['Baseline'] = baseline_preds
+    print(f"✓ Baseline RMSE: {baseline_metrics['RMSE']:.4f}")
+    
+    # Train models
     try:
-        arima_metrics, arima_preds = train_arima(train_df, test_df, symbol)
+        arima_metrics, arima_preds = train_arima(
+            train_df_raw, test_df_raw, engineer, symbol
+        )
         all_metrics['ARIMA'] = arima_metrics
         all_predictions['ARIMA'] = arima_preds
     except Exception as e:
         print(f"✗ ARIMA training failed: {str(e)}")
-        arima_preds = None
     
-    # 2. Train Linear Regression
     try:
-        lr_metrics, lr_preds, lr_data = train_linear_regression(train_df, val_df, test_df, symbol)
-        X_train, y_train, X_val, y_val, X_test, y_test = lr_data
+        lr_metrics, lr_preds, _ = train_linear_regression(
+            train_df, val_df, test_df, engineer, symbol
+        )
         all_metrics['Linear Regression'] = lr_metrics
         all_predictions['Linear Regression'] = lr_preds
     except Exception as e:
         print(f"✗ Linear Regression training failed: {str(e)}")
-        lr_preds = None
     
-    # 3. Train LSTM
     try:
-        lstm_metrics, lstm_preds, lstm_data = train_lstm(train_df, val_df, test_df, symbol)
-        X_train_lstm, y_train_lstm, X_val_lstm, y_val_lstm, X_test_lstm, y_test_lstm = lstm_data
+        lstm_metrics, lstm_preds = train_lstm(
+            train_df, val_df, test_df, engineer, symbol
+        )
         all_metrics['LSTM'] = lstm_metrics
         all_predictions['LSTM'] = lstm_preds
     except Exception as e:
         print(f"✗ LSTM training failed: {str(e)}")
-        lstm_preds = None
-        # Set dummy data for ensemble if LSTM fails - use the same length as other models
-        y_test_lstm = y_test[:len(y_test)]  # Use the same y_test as linear regression for ensemble
     
-    # 4. Train LightGBM (use same data as Linear Regression)
     try:
         lgbm_metrics, lgbm_preds = train_lightgbm(
-            train_df, val_df, test_df,
-            X_train, y_train, X_val, y_val, X_test, y_test,
-            symbol
+            train_df, val_df, test_df, engineer, symbol
         )
         all_metrics['LightGBM'] = lgbm_metrics
         all_predictions['LightGBM'] = lgbm_preds
     except Exception as e:
         print(f"✗ LightGBM training failed: {str(e)}")
-        lgbm_preds = None
     
-    # 5. Train Ensemble (if all base models succeeded)
-    if all(pred is not None for pred in [arima_preds, lr_preds, lstm_preds, lgbm_preds]):
-        try:
-            # Use LSTM test labels (they match in length with predictions)
-            ensemble_metrics, ensemble_preds = train_ensemble(
-                arima_preds, lr_preds, lstm_preds, lgbm_preds,
-                y_test_lstm, symbol
-            )
-            all_metrics['Ensemble'] = ensemble_metrics
-            all_predictions['Ensemble'] = ensemble_preds
-        except Exception as e:
-            print(f"✗ Ensemble training failed: {str(e)}")
-    else:
-        print("\n✗ Skipping ensemble training - some base models failed")
-    
-    # Evaluate and compare all models
+    # Final comparison
     print(f"\n{'='*80}")
-    print(f"FINAL MODEL COMPARISON")
+    print(f"FINAL MODEL COMPARISON (Original Scale)")
     print(f"{'='*80}")
     
-    evaluator = ModelEvaluator()
-    evaluator.results = all_metrics
-    comparison_df = evaluator.compare_models()
+    comparison_df = pd.DataFrame(all_metrics).T
+    comparison_df = comparison_df.round(4)
+    print(comparison_df)
     
-    # Save comparison
-    comparison_df.to_csv(f'results/{symbol}_model_comparison.csv')
-    print(f"\n✓ Model comparison saved to results/{symbol}_model_comparison.csv")
-    
-    # Save all predictions
-    if 'Ensemble' in all_predictions:
-        # Align all predictions to same length (use shortest)
-        min_len = min(len(pred) for pred in all_predictions.values())
-        aligned_predictions = {
-            name: pred[:min_len] for name, pred in all_predictions.items()
-        }
-        y_test_aligned = y_test_lstm[:min_len]
-        
-        save_all_predictions(y_test_aligned, aligned_predictions, symbol)
+    # Save results
+    comparison_df.to_csv(f'results/{symbol}_model_comparison_corrected.csv')
+    print(f"\n✓ Results saved to results/{symbol}_model_comparison_corrected.csv")
     
     # Calculate total time
     end_time = datetime.now()
@@ -374,7 +460,6 @@ def main(symbol='AAPL', period='2y'):
     print(f"\n{'#'*80}")
     print(f"# TRAINING COMPLETE")
     print(f"# Total time: {duration:.2f} seconds ({duration/60:.2f} minutes)")
-    print(f"# End time: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'#'*80}\n")
     
     return all_metrics, all_predictions, comparison_df
@@ -382,11 +467,11 @@ def main(symbol='AAPL', period='2y'):
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description='Train stock prediction models')
+    parser = argparse.ArgumentParser(description='Train stock prediction models (CORRECTED)')
     parser.add_argument('--symbol', type=str, default='AAPL', help='Stock symbol')
-    parser.add_argument('--period', type=str, default='2y', help='Time period (1y, 2y, 5y, max)')
+    parser.add_argument('--period', type=str, default='2y', help='Time period')
     
     args = parser.parse_args()
     
-    # Run training
+    # Run corrected training
     metrics, predictions, comparison = main(symbol=args.symbol, period=args.period)
