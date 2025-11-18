@@ -1,3 +1,12 @@
+"""
+MODIFIED train_all_models.py - Now works with ANY stock symbol
+
+Changes made to support any stock:
+1. Symbol parameter instead of hardcoded 'AAPL'
+2. Dynamic file paths based on symbol
+3. Flexible data loading for any ticker
+"""
+
 import pandas as pd
 import numpy as np
 import os
@@ -42,8 +51,7 @@ def create_directories():
 
 def load_and_prepare_data(symbol, period='2y'):
     """
-    Load data WITHOUT normalization
-    Normalization will be done AFTER train/test split
+    Load data WITHOUT normalization for ANY stock symbol
     """
     print(f"\n{'='*80}")
     print(f"LOADING AND PREPARING DATA FOR {symbol}")
@@ -52,17 +60,43 @@ def load_and_prepare_data(symbol, period='2y'):
     # Load data
     loader = StockDataLoader()
     
-    # Check if data exists
+    # Check if data exists, otherwise fetch
     if os.path.exists(f'data/raw/{symbol}.csv'):
         print(f"Loading existing data for {symbol}...")
-        df = loader.load_data(symbol)
+        try:
+            df = loader.load_data(symbol)
+            # Check if data is recent (within last 7 days)
+            if not df.empty and df.index[-1] < pd.Timestamp.now() - pd.Timedelta(days=7):
+                print(f"  ⚠️  Data is outdated, fetching fresh data...")
+                df = loader.fetch_stock_data(symbol, period=period)
+                if df is not None and not df.empty:
+                    loader.save_data(df, symbol)
+        except Exception as e:
+            print(f"  ⚠️  Error loading cached data: {e}")
+            print(f"  Fetching fresh data...")
+            df = loader.fetch_stock_data(symbol, period=period)
+            if df is not None and not df.empty:
+                loader.save_data(df, symbol)
     else:
         print(f"Fetching new data for {symbol}...")
         df = loader.fetch_stock_data(symbol, period=period)
         if df is not None and not df.empty:
             loader.save_data(df, symbol)
         else:
-            raise ValueError(f"No data available for symbol {symbol}")
+            raise ValueError(
+                f"❌ No data available for symbol {symbol}\n"
+                f"   Please verify:\n"
+                f"   1. Symbol is correct (try: AAPL, MSFT, GOOGL, AMZN)\n"
+                f"   2. You have internet connection\n"
+                f"   3. Symbol is actively traded\n"
+                f"   4. Try a different period (--period 5y or --period max)"
+            )
+    
+    # Validate data
+    if df is None or df.empty:
+        raise ValueError(f"❌ Failed to load data for {symbol}")
+    
+    print(f"✓ Loaded {len(df)} data points from {df.index[0].date()} to {df.index[-1].date()}")
     
     # Create features WITHOUT normalization
     engineer = FeatureEngineer()
@@ -73,10 +107,7 @@ def load_and_prepare_data(symbol, period='2y'):
     return features_df, engineer
 
 def split_data(df, train_ratio=0.7, val_ratio=0.15):
-    """
-    Split data into train, validation, and test sets
-    CRITICAL: This must be done BEFORE normalization
-    """
+    """Split data into train, validation, and test sets"""
     n = len(df)
     train_end = int(n * train_ratio)
     val_end = int(n * (train_ratio + val_ratio))
@@ -93,10 +124,7 @@ def split_data(df, train_ratio=0.7, val_ratio=0.15):
     return train_df, val_df, test_df
 
 def normalize_splits(train_df, val_df, test_df, engineer):
-    """
-    Normalize data AFTER splitting
-    Fit scalers on training data only
-    """
+    """Normalize data AFTER splitting"""
     print(f"\n{'='*80}")
     print("NORMALIZING DATA (No Data Leakage)")
     print(f"{'='*80}")
@@ -127,15 +155,11 @@ def prepare_model_data(train_df, val_df, test_df, feature_cols):
     return X_train, y_train, X_val, y_val, X_test, y_test
 
 def train_arima(train_df, test_df, engineer, symbol):
-    """
-    Train ARIMA model on ORIGINAL scale
-    """
+    """Train ARIMA model on ORIGINAL scale"""
     print(f"\n{'='*80}")
     print(f"TRAINING ARIMA MODEL")
     print(f"{'='*80}")
     
-    # ARIMA works on original scale, not normalized
-    # Use the non-normalized target
     train_series = train_df['Target']
     test_series = test_df['Target']
     
@@ -143,10 +167,9 @@ def train_arima(train_df, test_df, engineer, symbol):
     arima = ARIMAPredictor()
     metrics, predictions = arima.evaluate(train_series, test_series)
     
-    # Predictions are already in original scale
     predictions_original = predictions
     
-    # Save model
+    # Save model with symbol-specific name
     arima.save_model(f'models/saved_models/arima_models/{symbol}_arima.pkl')
     
     print(f"✓ ARIMA trained and evaluated")
@@ -162,27 +185,21 @@ def train_linear_regression(train_df, val_df, test_df, engineer, symbol):
     print(f"TRAINING LINEAR REGRESSION MODEL")
     print(f"{'='*80}")
     
-    # Get feature names (exclude Target)
     feature_cols = [col for col in train_df.columns if col != 'Target']
     
-    # Prepare data
     X_train, y_train, X_val, y_val, X_test, y_test = prepare_model_data(
         train_df, val_df, test_df, feature_cols
     )
     
-    # Initialize and train
     lr = LinearPredictor()
     lr.feature_cols = feature_cols
     lr.train(X_train, y_train)
     
-    # Evaluate on normalized scale
     metrics_normalized, predictions_normalized = lr.evaluate(X_test, y_test)
     
-    # Convert predictions back to original scale
     predictions_original = engineer.inverse_transform_target(predictions_normalized)
     y_test_original = engineer.inverse_transform_target(y_test.values)
     
-    # Calculate metrics on original scale
     from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
     mse = mean_squared_error(y_test_original, predictions_original)
     rmse = np.sqrt(mse)
@@ -198,7 +215,6 @@ def train_linear_regression(train_df, val_df, test_df, engineer, symbol):
         'MAPE': mape
     }
     
-    # Save model
     lr.save_model(f'models/saved_models/lr_model_{symbol}.pkl')
     
     print(f"✓ Linear Regression trained and evaluated")
@@ -214,19 +230,16 @@ def train_lstm(train_df, val_df, test_df, engineer, symbol):
     print(f"TRAINING LSTM MODEL")
     print(f"{'='*80}")
     
-    # Get feature columns
     feature_cols = [col for col in train_df.columns if col != 'Target']
     
-    # Initialize with proper settings
     lstm = LSTMPredictor(
         sequence_length=10, 
         units=50, 
-        layers=2,  # Reduced from 3
+        layers=2,
         dropout=0.2,
-        n_features=len(feature_cols)  # Pass number of features
+        n_features=len(feature_cols)
     )
     
-    # Prepare sequences using ALL features
     X_train, y_train = lstm.prepare_sequences(train_df, feature_cols)
     X_val, y_val = lstm.prepare_sequences(val_df, feature_cols)
     X_test, y_test = lstm.prepare_sequences(test_df, feature_cols)
@@ -236,23 +249,19 @@ def train_lstm(train_df, val_df, test_df, engineer, symbol):
     print(f"  Val: {X_val.shape}")
     print(f"  Test: {X_test.shape}")
     
-    # Train
     history = lstm.train(
         X_train, y_train,
         X_val, y_val,
-        epochs=50,  # Reduced for faster training
+        epochs=50,
         batch_size=32,
         model_path=f'models/saved_models/lstm_model_{symbol}.h5'
     )
     
-    # Evaluate on normalized scale
     metrics_normalized, predictions_normalized = lstm.evaluate(X_test, y_test)
     
-    # Convert to original scale
     predictions_original = engineer.inverse_transform_target(predictions_normalized)
     y_test_original = engineer.inverse_transform_target(y_test)
     
-    # Calculate metrics on original scale
     from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
     mse = mean_squared_error(y_test_original, predictions_original)
     rmse = np.sqrt(mse)
@@ -281,27 +290,21 @@ def train_lightgbm(train_df, val_df, test_df, engineer, symbol):
     print(f"TRAINING LIGHTGBM MODEL")
     print(f"{'='*80}")
     
-    # Get features
     feature_cols = [col for col in train_df.columns if col != 'Target']
     
-    # Prepare data
     X_train, y_train, X_val, y_val, X_test, y_test = prepare_model_data(
         train_df, val_df, test_df, feature_cols
     )
     
-    # Initialize and train
     lgbm = LightGBMPredictor()
     lgbm.train(X_train, y_train, X_val, y_val, 
                num_boost_round=500, early_stopping_rounds=50)
     
-    # Evaluate
     metrics_normalized, predictions_normalized = lgbm.evaluate(X_test, y_test)
     
-    # Convert to original scale
     predictions_original = engineer.inverse_transform_target(predictions_normalized)
     y_test_original = engineer.inverse_transform_target(y_test.values)
     
-    # Calculate metrics on original scale
     from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
     mse = mean_squared_error(y_test_original, predictions_original)
     rmse = np.sqrt(mse)
@@ -317,7 +320,6 @@ def train_lightgbm(train_df, val_df, test_df, engineer, symbol):
         'MAPE': mape
     }
     
-    # Save model
     lgbm.save_model(f'models/saved_models/lgbm_model_{symbol}.pkl')
     
     print(f"✓ LightGBM trained and evaluated")
@@ -328,18 +330,12 @@ def train_lightgbm(train_df, val_df, test_df, engineer, symbol):
     return metrics, predictions_original
 
 def create_baseline(test_df, engineer):
-    """
-    Create a simple baseline: tomorrow's price = today's price
-    This is the minimum performance any model should beat
-    """
-    # Get actual prices
+    """Create a simple baseline: tomorrow's price = today's price"""
     y_test_original = engineer.inverse_transform_target(test_df['Target'].values)
     
-    # Baseline: use previous day's target (shifted by 1)
     baseline_preds = test_df['Target'].shift(1).fillna(method='bfill').values
     baseline_preds = engineer.inverse_transform_target(baseline_preds)
     
-    # Calculate metrics
     from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
     mse = mean_squared_error(y_test_original, baseline_preds)
     rmse = np.sqrt(mse)
@@ -359,18 +355,16 @@ def create_baseline(test_df, engineer):
 
 def main(symbol='AAPL', period='2y'):
     """
-    CORRECTED training pipeline
-    Key changes:
-    1. Create features BEFORE splitting
-    2. Split data BEFORE normalization
-    3. Fit scalers on training data only
-    4. All models work on same scale (original)
-    5. Added baseline comparison
+    FLEXIBLE training pipeline for ANY stock symbol
+    
+    Args:
+        symbol: Stock ticker (e.g., 'TSLA', 'GOOGL', 'MSFT', 'AMZN')
+        period: Time period ('1y', '2y', '5y', 'max')
     """
     start_time = datetime.now()
     
     print(f"\n{'#'*80}")
-    print(f"# CORRECTED STOCK PRICE PREDICTION PIPELINE")
+    print(f"# STOCK PRICE PREDICTION PIPELINE")
     print(f"# Symbol: {symbol}")
     print(f"# Period: {period}")
     print(f"# Start time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -379,13 +373,13 @@ def main(symbol='AAPL', period='2y'):
     # Create directories
     create_directories()
     
-    # Step 1: Load and create features (NO normalization yet)
+    # Load and prepare data
     features_df, engineer = load_and_prepare_data(symbol, period)
     
-    # Step 2: Split data BEFORE normalization (CRITICAL)
+    # Split data BEFORE normalization
     train_df_raw, val_df_raw, test_df_raw = split_data(features_df)
     
-    # Step 3: Normalize using training statistics only
+    # Normalize using training statistics only
     train_df, val_df, test_df = normalize_splits(
         train_df_raw, val_df_raw, test_df_raw, engineer
     )
@@ -442,23 +436,23 @@ def main(symbol='AAPL', period='2y'):
     
     # Final comparison
     print(f"\n{'='*80}")
-    print(f"FINAL MODEL COMPARISON (Original Scale)")
+    print(f"FINAL MODEL COMPARISON FOR {symbol} (Original Scale)")
     print(f"{'='*80}")
     
     comparison_df = pd.DataFrame(all_metrics).T
     comparison_df = comparison_df.round(4)
     print(comparison_df)
     
-    # Save results
-    comparison_df.to_csv(f'results/{symbol}_model_comparison_corrected.csv')
-    print(f"\n✓ Results saved to results/{symbol}_model_comparison_corrected.csv")
+    # Save results with symbol-specific filename
+    comparison_df.to_csv(f'results/{symbol}_model_comparison.csv')
+    print(f"\n✓ Results saved to results/{symbol}_model_comparison.csv")
     
     # Calculate total time
     end_time = datetime.now()
     duration = (end_time - start_time).total_seconds()
     
     print(f"\n{'#'*80}")
-    print(f"# TRAINING COMPLETE")
+    print(f"# TRAINING COMPLETE FOR {symbol}")
     print(f"# Total time: {duration:.2f} seconds ({duration/60:.2f} minutes)")
     print(f"{'#'*80}\n")
     
@@ -467,11 +461,26 @@ def main(symbol='AAPL', period='2y'):
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description='Train stock prediction models (CORRECTED)')
-    parser.add_argument('--symbol', type=str, default='AAPL', help='Stock symbol')
-    parser.add_argument('--period', type=str, default='2y', help='Time period')
+    parser = argparse.ArgumentParser(
+        description='Train stock prediction models for ANY symbol'
+    )
+    parser.add_argument(
+        '--symbol', 
+        type=str, 
+        default='AAPL',
+        help='Stock symbol (e.g., AAPL, TSLA, GOOGL, MSFT, AMZN)'
+    )
+    parser.add_argument(
+        '--period', 
+        type=str, 
+        default='2y',
+        help='Time period (1y, 2y, 5y, max)'
+    )
     
     args = parser.parse_args()
     
-    # Run corrected training
-    metrics, predictions, comparison = main(symbol=args.symbol, period=args.period)
+    # Run training for ANY stock
+    metrics, predictions, comparison = main(
+        symbol=args.symbol.upper(), 
+        period=args.period
+    )
