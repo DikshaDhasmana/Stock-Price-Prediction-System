@@ -1,39 +1,58 @@
+"""
+utils/data_loader.py - yfinance-based stock data loader
+
+Provides StockDataLoader with:
+- fetch_stock_data(symbol, period='2y')
+- load_data(symbol)
+- save_data(df, symbol)
+"""
+
+import os
 import pandas as pd
 import yfinance as yf
-import os
+from typing import Optional
+
+RAW_DIR = "data/raw"
+os.makedirs(RAW_DIR, exist_ok=True)
+
 
 class StockDataLoader:
-    def __init__(self):
-        pass
+    def __init__(self, raw_dir: str = RAW_DIR):
+        self.raw_dir = raw_dir
 
-    def fetch_stock_data(self, symbol, period='2y'):
-        """Fetch stock data from Yahoo Finance"""
+    def raw_path(self, symbol: str) -> str:
+        return f"{self.raw_dir}/{symbol.upper()}.csv"
+
+    def fetch_stock_data(self, symbol: str, period: str = "2y", interval: str = "1d") -> Optional[pd.DataFrame]:
+        """
+        Fetch OHLCV using yfinance. period examples: '1y','2y','5y','max'
+        """
         try:
-            ticker = yf.Ticker(symbol)
-            df = ticker.history(period=period)
-            df = df.reset_index()
-            df['Date'] = pd.to_datetime(df['Date'])
-            df.set_index('Date', inplace=True)
+            df = yf.download(symbol, period=period, interval=interval, progress=False)
+            if df is None or df.empty:
+                return None
+            # Ensure datetime index and drop NA
+            df = df.dropna()
+            df.index = pd.to_datetime(df.index)
             return df
         except Exception as e:
-            print(f"Error fetching data for {symbol}: {e}")
+            print(f"❌ yfinance fetch failed for {symbol}: {e}")
             return None
 
-    def load_data(self, symbol):
-        """Load data from CSV file"""
-        filepath = f'data/raw/{symbol}.csv'
-        if os.path.exists(filepath):
-            df = pd.read_csv(filepath, index_col=0, parse_dates=True)
-            return df
-        else:
-            raise FileNotFoundError(f"Data file not found: {filepath}")
+    def save_data(self, df: pd.DataFrame, symbol: str):
+        path = self.raw_path(symbol)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        df.to_csv(path)
+        print(f"✓ Raw data saved to {path}")
 
-    def save_data(self, df, symbol):
-        """Save data to CSV file"""
-        os.makedirs('data/raw', exist_ok=True)
-        filepath = f'data/raw/{symbol}.csv'
-        if df is not None and not df.empty:
-            df.to_csv(filepath)
-            print(f"Data saved to {filepath}")
-        else:
-            print(f"No data to save for {symbol}")
+    def load_data(self, symbol: str) -> Optional[pd.DataFrame]:
+        path = self.raw_path(symbol)
+        if not os.path.exists(path):
+            return None
+        try:
+            df = pd.read_csv(path, index_col=0, parse_dates=True)
+            df.index = pd.to_datetime(df.index)
+            return df
+        except Exception as e:
+            print(f"❌ Failed to load raw data from {path}: {e}")
+            return None

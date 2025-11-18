@@ -1,397 +1,256 @@
 """
-sentiment_analyzer.py - Financial News Sentiment Analysis with FinBERT
+sentiment_analyzer.py - Alpha Vantage NEWS_SENTIMENT (Free plan) + aggregation
 
-This module:
-1. Fetches financial news from NewsAPI
-2. Analyzes sentiment using FinBERT (financial domain-specific BERT)
-3. Aggregates daily sentiment scores
-4. Integrates sentiment features into stock prediction pipeline
+- Uses Alpha Vantage NEWS_SENTIMENT endpoint
+- Caches JSON responses to avoid repeat calls
+- Parses per-article and ticker sentiment (Alpha Vantage fields are best-effort)
+- Aggregates daily signals and adds rolling windows + momentum
+- Exposes FinancialSentimentAnalyzer.run_pipeline(symbol, start_date, end_date)
+- Saves CSV to data/sentiment/{SYMBOL}_sentiment.csv
 
-Requirements:
-    pip install transformers torch newsapi-python
-
-Get your NewsAPI key from: https://newsapi.org/
+Requires:
+    pip install requests pandas numpy python-dateutil
+Environment:
+    ALPHA_VANTAGE_API_KEY must be set (or pass api_key to class)
 """
+from __future__ import annotations
+import os
+import time
+import json
+from typing import List, Dict, Optional
+from datetime import datetime, timezone
+from dateutil import parser as dateparser
 
+import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
-import os
-import pickle
-from typing import List, Dict, Tuple
 
-# News API
-try:
-    from newsapi import NewsApiClient
-except ImportError:
-    print("⚠️  NewsAPI not installed. Run: pip install newsapi-python")
-
-# FinBERT for sentiment analysis
-try:
-    from transformers import AutoTokenizer, AutoModelForSequenceClassification
-    import torch
-    FINBERT_AVAILABLE = True
-except ImportError:
-    print("⚠️  Transformers not installed. Run: pip install transformers torch")
-    FINBERT_AVAILABLE = False
+ALPHA_VANTAGE_URL = "https://www.alphavantage.co/query"
+CACHE_DIR = "data/sentiment_cache"
+OUTPUT_DIR = "data/sentiment"
+os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 class FinancialSentimentAnalyzer:
     """
-    Analyze sentiment of financial news using FinBERT
-    
-    FinBERT is specifically trained on financial text and outperforms
-    general BERT models for finance-related sentiment analysis
+    Alpha Vantage NEWS_SENTIMENT wrapper.
+
+    Usage:
+        analyzer = FinancialSentimentAnalyzer(api_key="XXX")
+        df = analyzer.run_pipeline("AAPL", "2023-01-01", "2024-01-01")
     """
-    
-    def __init__(self, news_api_key=None, model_name='ProsusAI/finbert'):
+
+    def __init__(self, api_key: Optional[str] = None, max_articles: int = 500):
+        self.api_key = api_key or os.getenv("ALPHA_VANTAGE_API_KEY")
+        if not self.api_key:
+            raise ValueError("Alpha Vantage API key required. Set ALPHA_VANTAGE_API_KEY or pass api_key.")
+        self.max_articles = int(max_articles)
+
+    def _cache_path(self, symbol: str, start: str, end: str) -> str:
+        safe_symbol = symbol.upper()
+        return os.path.join(CACHE_DIR, f"{safe_symbol}__{start}__{end}.json")
+
+    def fetch_feed(self, symbol: str, start_date: str, end_date: str, force_refresh: bool = False) -> List[Dict]:
         """
-        Initialize sentiment analyzer
-        
-        Args:
-            news_api_key: NewsAPI key (get from https://newsapi.org/)
-            model_name: HuggingFace model name (default: FinBERT)
+        Fetch feed from Alpha Vantage and cache the JSON.
+        start_date and end_date are ISO strings 'YYYY-MM-DD'
         """
-        self.news_api_key = news_api_key or os.getenv('NEWS_API_KEY')
-        self.model_name = model_name
-        
-        # Initialize NewsAPI client
-        if self.news_api_key:
+        cache_file = self._cache_path(symbol, start_date, end_date)
+        if os.path.exists(cache_file) and not force_refresh:
             try:
-                self.newsapi = NewsApiClient(api_key=self.news_api_key)
-                print("✓ NewsAPI client initialized")
-            except Exception as e:
-                print(f"⚠️  NewsAPI initialization failed: {e}")
-                self.newsapi = None
-        else:
-            print("⚠️  No NewsAPI key provided. Set NEWS_API_KEY environment variable")
-            self.newsapi = None
-        
-        # Initialize FinBERT model
-        self.tokenizer = None
-        self.model = None
-        self.device = None
-        
-        if FINBERT_AVAILABLE:
-            self._load_finbert_model()
-    
-    def _load_finbert_model(self):
-        """Load FinBERT model and tokenizer"""
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                feed = payload.get("feed", []) or payload.get("items", []) or []
+                return feed[: self.max_articles]
+            except Exception:
+                pass
+
+        params = {
+            "function": "NEWS_SENTIMENT",
+            "tickers": symbol,
+            "time_from": start_date,
+            "time_to": end_date,
+            "apikey": self.api_key
+        }
+
         try:
-            print(f"\nLoading FinBERT model: {self.model_name}")
-            print("(First time will download ~500MB model)")
-            
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-            self.model = AutoModelForSequenceClassification.from_pretrained(self.model_name)
-            
-            # Use GPU if available
-            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            self.model.to(self.device)
-            self.model.eval()
-            
-            print(f"✓ FinBERT loaded on device: {self.device}")
-            
+            r = requests.get(ALPHA_VANTAGE_URL, params=params, timeout=30)
+            r.raise_for_status()
+            payload = r.json()
+
+            # Rate-limit / note handling
+            if isinstance(payload, dict) and ("Note" in payload or "Information" in payload):
+                # save what we got, but warn
+                print("⚠️ Alpha Vantage returned Note/Information (possible rate limit).")
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+
+            feed = payload.get("feed", []) or payload.get("items", []) or []
+            return feed[: self.max_articles]
         except Exception as e:
-            print(f"❌ Failed to load FinBERT: {e}")
-            print("   Falling back to rule-based sentiment (less accurate)")
-    
-    def fetch_news(self, symbol: str, start_date: str, end_date: str, 
-                   max_articles: int = 100) -> List[Dict]:
-        """
-        Fetch financial news from NewsAPI
-        
-        Args:
-            symbol: Stock symbol (e.g., 'AAPL')
-            start_date: Start date (YYYY-MM-DD)
-            end_date: End date (YYYY-MM-DD)
-            max_articles: Maximum articles to fetch
-            
-        Returns:
-            List of news articles with metadata
-        """
-        if not self.newsapi:
-            print("❌ NewsAPI not initialized. Cannot fetch news.")
+            print(f"❌ Alpha Vantage fetch failed: {e}")
             return []
-        
+
+    @staticmethod
+    def _parse_timestamp(ts_str: Optional[str]) -> Optional[datetime]:
+        if not ts_str:
+            return None
         try:
-            # Get company name for better search results
-            company_names = {
-                'AAPL': 'Apple',
-                'MSFT': 'Microsoft',
-                'GOOGL': 'Google',
-                'AMZN': 'Amazon',
-                'TSLA': 'Tesla',
-                'META': 'Meta',
-                'NVDA': 'Nvidia'
+            dt = dateparser.parse(ts_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            return None
+
+    @staticmethod
+    def _av_label_to_numeric(label: Optional[str]) -> float:
+        """Map common labels to numeric [-1,1]"""
+        if not label:
+            return 0.0
+        mapping = {
+            "positive": 1.0,
+            "somewhat-positive": 0.5,
+            "neutral": 0.0,
+            "somewhat-negative": -0.5,
+            "negative": -1.0
+        }
+        return float(mapping.get(label.lower(), 0.0))
+
+    def _parse_item(self, item: Dict) -> Optional[Dict]:
+        """
+        Parse one feed item. AlphaVantage items vary in keys; handle robustly.
+        Returns standardized dict:
+            {date(datetime), title, summary, av_label, av_score, per_ticker_scores(dict)}
+        """
+        try:
+            title = item.get("title") or item.get("headline") or ""
+            summary = item.get("summary") or item.get("text") or item.get("summary_text") or ""
+            published = item.get("time_published") or item.get("published_at") or item.get("datetime") or item.get("date")
+            dt = self._parse_timestamp(published) or datetime.now(timezone.utc)
+
+            av_label = item.get("overall_sentiment_label") or item.get("overall_sentiment") or None
+            av_score = item.get("overall_sentiment_score", None)
+            try:
+                if av_score is not None:
+                    av_score = float(av_score)
+                    av_score = max(-1.0, min(1.0, av_score))
+            except Exception:
+                av_score = None
+
+            # ticker_sentiment may exist as list
+            per_ticker = {}
+            tlist = item.get("ticker_sentiment") or item.get("tickers") or []
+            if isinstance(tlist, list):
+                for t in tlist:
+                    try:
+                        tk = t.get("ticker") or t.get("symbol")
+                        score = t.get("ticker_sentiment_score") or t.get("sentiment_score")
+                        if score is not None:
+                            score = float(score)
+                            score = max(-1.0, min(1.0, score))
+                        per_ticker[tk] = score
+                    except Exception:
+                        continue
+
+            return {
+                "title": title,
+                "summary": summary,
+                "time_published": dt,
+                "av_label": av_label,
+                "av_score": av_score,
+                "per_ticker": per_ticker
             }
-            
-            query = f"{company_names.get(symbol, symbol)} stock"
-            
-            print(f"\nFetching news for {symbol} ({start_date} to {end_date})")
-            
-            # Fetch news
-            response = self.newsapi.get_everything(
-                q=query,
-                from_param=start_date,
-                to=end_date,
-                language='en',
-                sort_by='relevancy',
-                page_size=min(max_articles, 100)
-            )
-            
-            articles = response.get('articles', [])
-            print(f"✓ Fetched {len(articles)} articles")
-            
-            return articles
-            
-        except Exception as e:
-            print(f"❌ News fetch failed: {e}")
-            return []
-    
-    def analyze_sentiment_finbert(self, text: str) -> Tuple[str, float]:
+        except Exception:
+            return None
+
+    def calculate_daily_sentiment(self, feed: List[Dict], symbol: Optional[str] = None) -> pd.DataFrame:
         """
-        Analyze sentiment using FinBERT
-        
-        Args:
-            text: Text to analyze
-            
-        Returns:
-            (sentiment_label, confidence_score)
-            sentiment_label: 'positive', 'negative', or 'neutral'
-            confidence_score: float between 0 and 1
+        Convert raw feed list into a daily aggregated DataFrame.
+        Columns:
+            Sentiment_Score, Article_Count, AlphaVantage_Score_mean,
+            Sentiment_Roll_3d, Sentiment_Roll_7d, Sentiment_Roll_14d, Sentiment_Momentum_1d
         """
-        if not self.model or not self.tokenizer:
-            return self._rule_based_sentiment(text)
-        
-        try:
-            # Tokenize
-            inputs = self.tokenizer(
-                text, 
-                return_tensors="pt", 
-                truncation=True, 
-                max_length=512,
-                padding=True
-            )
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            
-            # Get prediction
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-                predictions = torch.nn.functional.softmax(outputs.logits, dim=-1)
-            
-            # FinBERT outputs: [negative, neutral, positive]
-            sentiment_scores = predictions[0].cpu().numpy()
-            sentiment_idx = np.argmax(sentiment_scores)
-            sentiment_labels = ['negative', 'neutral', 'positive']
-            
-            sentiment = sentiment_labels[sentiment_idx]
-            confidence = float(sentiment_scores[sentiment_idx])
-            
-            return sentiment, confidence
-            
-        except Exception as e:
-            print(f"⚠️  FinBERT analysis failed: {e}")
-            return self._rule_based_sentiment(text)
-    
-    def _rule_based_sentiment(self, text: str) -> Tuple[str, float]:
-        """Fallback rule-based sentiment (less accurate)"""
-        text_lower = text.lower()
-        
-        positive_words = ['gain', 'profit', 'growth', 'rise', 'surge', 'jump', 
-                         'high', 'strong', 'beat', 'exceed', 'outperform']
-        negative_words = ['loss', 'drop', 'fall', 'decline', 'weak', 'miss',
-                         'underperform', 'concern', 'risk', 'cut']
-        
-        pos_count = sum(word in text_lower for word in positive_words)
-        neg_count = sum(word in text_lower for word in negative_words)
-        
-        if pos_count > neg_count:
-            return 'positive', 0.6
-        elif neg_count > pos_count:
-            return 'negative', 0.6
-        else:
-            return 'neutral', 0.5
-    
-    def calculate_daily_sentiment(self, articles: List[Dict]) -> pd.DataFrame:
-        """
-        Calculate daily aggregated sentiment scores
-        
-        Args:
-            articles: List of news articles
-            
-        Returns:
-            DataFrame with daily sentiment scores
-        """
-        if not articles:
+        if not feed:
             return pd.DataFrame()
-        
-        print("\nAnalyzing sentiment for each article...")
-        
-        # Analyze each article
-        sentiment_data = []
-        for i, article in enumerate(articles):
-            # Combine title and description for analysis
-            text = f"{article.get('title', '')} {article.get('description', '')}"
-            
-            if not text.strip():
+
+        parsed = []
+        for it in feed:
+            p = self._parse_item(it)
+            if p is None:
                 continue
-            
-            # Get sentiment
-            sentiment, confidence = self.analyze_sentiment_finbert(text)
-            
-            # Convert to numerical score: negative=-1, neutral=0, positive=1
-            sentiment_score = {'negative': -1, 'neutral': 0, 'positive': 1}[sentiment]
-            weighted_score = sentiment_score * confidence
-            
-            # Extract date
-            published_at = article.get('publishedAt', '')
-            if published_at:
-                date = pd.to_datetime(published_at).date()
-            else:
-                continue
-            
-            sentiment_data.append({
-                'date': date,
-                'sentiment': sentiment,
-                'score': sentiment_score,
-                'confidence': confidence,
-                'weighted_score': weighted_score,
-                'title': article.get('title', '')[:100]  # First 100 chars
-            })
-            
-            if (i + 1) % 10 == 0:
-                print(f"  Analyzed {i + 1}/{len(articles)} articles...")
-        
-        # Create DataFrame
-        df = pd.DataFrame(sentiment_data)
-        
+            # If symbol present in per_ticker, prefer that score
+            if symbol:
+                st = p["per_ticker"].get(symbol.upper())
+                if st is not None:
+                    p["av_score"] = st
+            parsed.append(p)
+
+        if not parsed:
+            return pd.DataFrame()
+
+        rows = []
+        for p in parsed:
+            date = p["time_published"].astimezone(timezone.utc).date()
+            # choose av_score numeric if present, else map av_label
+            av_score = p["av_score"]
+            if av_score is None and p["av_label"]:
+                av_score = self._av_label_to_numeric(p["av_label"])
+            # fallback 0
+            av_score = 0.0 if av_score is None else float(av_score)
+            # small heuristic: combined score = av_score (AlphaVantage is reasonably good)
+            combined = av_score
+            rows.append({"date": pd.to_datetime(date), "combined_score": combined, "av_score": av_score})
+
+        df = pd.DataFrame(rows)
         if df.empty:
-            return df
-        
-        # Aggregate by day
-        daily_sentiment = df.groupby('date').agg({
-            'weighted_score': 'mean',  # Average sentiment
-            'confidence': 'mean',       # Average confidence
-            'score': ['count', 'mean']  # Article count and raw sentiment
-        }).reset_index()
-        
-        daily_sentiment.columns = ['Date', 'Sentiment_Score', 'Sentiment_Confidence', 
-                                   'Article_Count', 'Raw_Sentiment']
-        
-        # Convert date to datetime
-        daily_sentiment['Date'] = pd.to_datetime(daily_sentiment['Date'])
-        daily_sentiment = daily_sentiment.set_index('Date')
-        
-        print(f"\n✓ Daily sentiment calculated for {len(daily_sentiment)} days")
-        print(f"  Average sentiment: {daily_sentiment['Sentiment_Score'].mean():.3f}")
-        print(f"  Average article count: {daily_sentiment['Article_Count'].mean():.1f} per day")
-        
-        return daily_sentiment
-    
-    def integrate_with_features(self, features_df: pd.DataFrame, 
-                               sentiment_df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Merge sentiment scores with technical features
-        
-        Args:
-            features_df: DataFrame with technical features
-            sentiment_df: DataFrame with daily sentiment scores
-            
-        Returns:
-            Combined DataFrame with both technical and sentiment features
-        """
-        print("\nIntegrating sentiment with technical features...")
-        
-        # Ensure both have datetime index
-        if not isinstance(features_df.index, pd.DatetimeIndex):
-            features_df.index = pd.to_datetime(features_df.index)
-        
-        # Merge on date
-        combined_df = features_df.join(sentiment_df, how='left')
-        
-        # Forward fill missing sentiment (use previous day's sentiment)
-        sentiment_cols = ['Sentiment_Score', 'Sentiment_Confidence', 
-                         'Article_Count', 'Raw_Sentiment']
-        combined_df[sentiment_cols] = combined_df[sentiment_cols].fillna(method='ffill')
-        
-        # Fill any remaining NaNs with neutral sentiment
-        combined_df['Sentiment_Score'] = combined_df['Sentiment_Score'].fillna(0)
-        combined_df['Sentiment_Confidence'] = combined_df['Sentiment_Confidence'].fillna(0.5)
-        combined_df['Article_Count'] = combined_df['Article_Count'].fillna(0)
-        combined_df['Raw_Sentiment'] = combined_df['Raw_Sentiment'].fillna(0)
-        
-        print(f"✓ Combined features: {len(combined_df)} samples, {len(combined_df.columns)} features")
-        print(f"  Added sentiment features: {sentiment_cols}")
-        
-        return combined_df
-    
-    def save_sentiment_data(self, sentiment_df: pd.DataFrame, symbol: str):
-        """Save sentiment data for future use"""
-        os.makedirs('data/sentiment', exist_ok=True)
-        filepath = f'data/sentiment/{symbol}_sentiment.csv'
-        sentiment_df.to_csv(filepath)
-        print(f"\n✓ Sentiment data saved to {filepath}")
+            return pd.DataFrame()
 
+        agg = df.groupby("date").agg(
+            Sentiment_Score=("combined_score", "mean"),
+            Article_Count=("combined_score", "count"),
+            AlphaVantage_Score=("av_score", "mean")
+        ).reset_index().set_index("date").sort_index()
 
-def demo_sentiment_analysis(symbol='AAPL', days_back=30):
-    """
-    Demonstration of sentiment analysis system
-    
-    NOTE: Requires NewsAPI key. Get free key from https://newsapi.org/
-    """
-    print(f"\n{'='*80}")
-    print("FINANCIAL SENTIMENT ANALYSIS DEMO")
-    print(f"{'='*80}")
-    
-    # Initialize analyzer
-    analyzer = FinancialSentimentAnalyzer()
-    
-    # Calculate date range
-    end_date = datetime.now().date()
-    start_date = end_date - timedelta(days=days_back)
-    
-    # Fetch news
-    articles = analyzer.fetch_news(
-        symbol, 
-        start_date.isoformat(), 
-        end_date.isoformat()
-    )
-    
-    if not articles:
-        print("\n⚠️  No articles fetched. Check your NewsAPI key.")
-        print("   Get a free key from: https://newsapi.org/")
-        return None
-    
-    # Calculate sentiment
-    sentiment_df = analyzer.calculate_daily_sentiment(articles)
-    
-    if sentiment_df.empty:
-        print("❌ No sentiment data generated")
-        return None
-    
-    # Display sample
-    print("\nSample Daily Sentiment:")
-    print(sentiment_df.head(10))
-    
-    # Save data
-    analyzer.save_sentiment_data(sentiment_df, symbol)
-    
-    return sentiment_df
+        # create continuous date index
+        start = agg.index.min()
+        end = agg.index.max()
+        all_days = pd.date_range(start=start, end=end, freq="D")
+        agg = agg.reindex(all_days)
+        agg.index.name = "Date"
 
+        # fill
+        agg["Sentiment_Score"] = agg["Sentiment_Score"].ffill().fillna(0.0)
+        agg["AlphaVantage_Score"] = agg["AlphaVantage_Score"].ffill().fillna(0.0)
+        agg["Article_Count"] = agg["Article_Count"].fillna(0).astype(int)
 
-if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Financial sentiment analysis')
-    parser.add_argument('--symbol', type=str, default='AAPL', help='Stock symbol')
-    parser.add_argument('--days', type=int, default=30, help='Days to analyze')
-    parser.add_argument('--api-key', type=str, help='NewsAPI key')
-    
-    args = parser.parse_args()
-    
-    # Set API key if provided
-    if args.api_key:
-        os.environ['NEWS_API_KEY'] = args.api_key
-    
-    # Run demo
-    sentiment_df = demo_sentiment_analysis(args.symbol, args.days)
+        # Rolling features
+        agg["Sentiment_Roll_3d"] = agg["Sentiment_Score"].rolling(3, min_periods=1).mean()
+        agg["Sentiment_Roll_7d"] = agg["Sentiment_Score"].rolling(7, min_periods=1).mean()
+        agg["Sentiment_Roll_14d"] = agg["Sentiment_Score"].rolling(14, min_periods=1).mean()
+        agg["Sentiment_Momentum_1d"] = agg["Sentiment_Score"].diff().fillna(0.0)
+
+        # final columns
+        result = agg[[
+            "Sentiment_Score", "Article_Count", "AlphaVantage_Score",
+            "Sentiment_Roll_3d", "Sentiment_Roll_7d", "Sentiment_Roll_14d", "Sentiment_Momentum_1d"
+        ]].copy()
+
+        # save location note
+        return result
+
+    def save_sentiment(self, sentiment_df: pd.DataFrame, symbol: str) -> str:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        path = os.path.join(OUTPUT_DIR, f"{symbol.upper()}_sentiment.csv")
+        sentiment_df.to_csv(path, index=True)
+        print(f"✓ Sentiment saved to {path}")
+        return path
+
+    def run_pipeline(self, symbol: str, start_date: str, end_date: str, force_refresh: bool = False) -> pd.DataFrame:
+        feed = self.fetch_feed(symbol, start_date, end_date, force_refresh=force_refresh)
+        print(f"Fetched {len(feed)} items for {symbol} from Alpha Vantage.")
+        daily = self.calculate_daily_sentiment(feed, symbol=symbol)
+        if daily is not None and not daily.empty:
+            self.save_sentiment(daily, symbol)
+        return daily

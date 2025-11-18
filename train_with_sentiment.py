@@ -1,446 +1,299 @@
 """
-train_with_sentiment.py - Train Models WITH Sentiment Analysis
+train_with_sentiment.py - Train models WITH Alpha Vantage sentiment (Free plan)
 
-This script:
-1. Loads historical stock data
-2. Fetches and analyzes financial news sentiment
-3. Combines technical + sentiment features  
-4. Trains all models with enhanced features
-5. Compares performance with/without sentiment
-
-Usage:
-    python train_with_sentiment.py --symbol AAPL --api-key YOUR_NEWS_API_KEY
+- Uses yfinance (via utils.data_loader.StockDataLoader)
+- Uses sentiment_analyzer.FinancialSentimentAnalyzer (Alpha Vantage)
+- Trains ARIMA, LinearRegression, LSTM, LightGBM
+- Aligns sequence lengths: drops initial seq_len rows from non-LSTM models so all predictions match
+- Trains EnsemblePredictor on base model predictions
+- Saves models to models/saved_models_with_sentiment/
 """
 
-import pandas as pd
-import numpy as np
 import os
 import sys
 from datetime import datetime, timedelta
 
+import numpy as np
+import pandas as pd
+
+# project root
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from utils.data_loader import StockDataLoader
 from utils.feature_engineering import FeatureEngineer
 from sentiment_analyzer import FinancialSentimentAnalyzer
 
-# Import models
+# models
 from models.linear_model import LinearPredictor
 from models.lstm_model import LSTMPredictor
 from models.lgbm_model import LightGBMPredictor
+from models.arima_model import ARIMAPredictor
 from models.ensemble import EnsemblePredictor
 
-# Set random seeds
+# reproducibility
 np.random.seed(42)
 import tensorflow as tf
 tf.random.set_seed(42)
 
-
-def fetch_and_analyze_sentiment(symbol, start_date, end_date, api_key=None):
-    """
-    Fetch news and calculate sentiment scores
-    """
-    print(f"\n{'='*80}")
-    print("FETCHING AND ANALYZING FINANCIAL NEWS SENTIMENT")
-    print(f"{'='*80}")
-    
-    # Initialize analyzer
-    analyzer = FinancialSentimentAnalyzer(news_api_key=api_key)
-    
-    # Fetch news
-    articles = analyzer.fetch_news(
-        symbol,
-        start_date.isoformat(),
-        end_date.isoformat(),
-        max_articles=100
-    )
-    
-    if not articles:
-        print("\n⚠️  WARNING: No news articles fetched")
-        print("   Possible reasons:")
-        print("   1. Invalid or missing NewsAPI key")
-        print("   2. API rate limit reached (free tier: 100 requests/day)")
-        print("   3. No news available for date range")
-        print("\n   Get free key: https://newsapi.org/")
-        print("   Continuing WITHOUT sentiment features...")
-        return None
-    
-    # Calculate daily sentiment
-    sentiment_df = analyzer.calculate_daily_sentiment(articles)
-    
-    if sentiment_df.empty:
-        print("⚠️  No sentiment data generated")
-        return None
-    
-    # Save sentiment data
-    analyzer.save_sentiment_data(sentiment_df, symbol)
-    
-    return sentiment_df
+# output dirs
+SAVED_DIR = "models/saved_models_with_sentiment"
+os.makedirs(SAVED_DIR, exist_ok=True)
+os.makedirs("results", exist_ok=True)
 
 
-def prepare_data_with_sentiment(symbol, api_key=None, period='2y'):
-    """
-    Prepare features WITH sentiment analysis
-    """
-    print(f"\n{'='*80}")
-    print(f"PREPARING DATA WITH SENTIMENT FOR {symbol}")
-    print(f"{'='*80}")
-    
-    # Load stock data
+def prepare_data_with_sentiment(symbol: str, api_key: str = None, period: str = "2y"):
     loader = StockDataLoader()
-    
-    # Try to load existing data
-    if os.path.exists(f'data/raw/{symbol}.csv'):
-        df = loader.load_data(symbol)
-        if df.index[-1] < pd.Timestamp.now() - pd.Timedelta(days=7):
-            print("  Data outdated, fetching fresh data...")
-            df = loader.fetch_stock_data(symbol, period=period)
-            if df is not None:
-                loader.save_data(df, symbol)
-    else:
-        df = loader.fetch_stock_data(symbol, period=period)
-        if df is not None:
-            loader.save_data(df, symbol)
-    
+    # load or fetch raw
+    df = loader.load_data(symbol)
     if df is None or df.empty:
-        raise ValueError(f"Failed to load data for {symbol}")
-    
-    print(f"✓ Stock data: {len(df)} samples from {df.index[0].date()} to {df.index[-1].date()}")
-    
-    # Create technical features
+        df = loader.fetch_stock_data(symbol, period=period)
+        if df is None or df.empty:
+            raise ValueError(f"No price data for {symbol}")
+        loader.save_data(df, symbol)
+
+    # generate technical features
     engineer = FeatureEngineer()
     features_df = engineer.create_features(df, n_lags=5, horizon=1)
-    
-    print(f"✓ Technical features: {len(features_df.columns)} features")
-    
-    # Fetch and integrate sentiment
-    start_date = df.index[0].date()
-    end_date = df.index[-1].date()
-    
-    sentiment_df = fetch_and_analyze_sentiment(symbol, start_date, end_date, api_key)
-    
-    if sentiment_df is not None:
-        # Integrate sentiment with technical features
-        analyzer = FinancialSentimentAnalyzer()
-        combined_df = analyzer.integrate_with_features(features_df, sentiment_df)
-        
-        # Save combined features
-        os.makedirs('data/processed', exist_ok=True)
-        combined_df.to_csv(f'data/processed/{symbol}_features_with_sentiment.csv')
-        print(f"✓ Saved enhanced features to data/processed/{symbol}_features_with_sentiment.csv")
-        
-        has_sentiment = True
-    else:
-        combined_df = features_df
+
+    # sentiment pipeline (Alpha Vantage)
+    start_date = df.index[0].date().isoformat()
+    end_date = df.index[-1].date().isoformat()
+    analyzer = FinancialSentimentAnalyzer(api_key)
+    sentiment_df = analyzer.run_pipeline(symbol, start_date, end_date)
+
+    if sentiment_df is None or sentiment_df.empty:
+        print("⚠️ No sentiment produced; continuing without sentiment")
+        combined = features_df
         has_sentiment = False
-    
-    return combined_df, engineer, has_sentiment
+    else:
+        combined = analyzer.integrate_with_features(features_df, sentiment_df) if hasattr(analyzer, "integrate_with_features") else features_df.join(sentiment_df, how="left")
+        # ensure columns filled
+        combined = combined.fillna(method="ffill").fillna(0)
+        out_path = f"data/processed/{symbol}_features_with_sentiment.csv"
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        combined.to_csv(out_path)
+        has_sentiment = True
+        print(f"✓ Combined features saved to {out_path}")
+
+    return combined, engineer, has_sentiment
 
 
-def split_and_normalize(df, engineer, train_ratio=0.7, val_ratio=0.15):
-    """Split data and normalize"""
-    n = len(df)
+def split_and_scale(combined_df: pd.DataFrame, engineer: FeatureEngineer, train_ratio=0.7, val_ratio=0.15):
+    n = len(combined_df)
     train_end = int(n * train_ratio)
     val_end = int(n * (train_ratio + val_ratio))
-    
-    train_df = df[:train_end].copy()
-    val_df = df[train_end:val_end].copy()
-    test_df = df[val_end:].copy()
-    
-    print(f"\n✓ Data split:")
-    print(f"  Train: {len(train_df)} | Val: {len(val_df)} | Test: {len(test_df)}")
-    
-    # Normalize
+
+    train_df = combined_df[:train_end].copy()
+    val_df = combined_df[train_end:val_end].copy()
+    test_df = combined_df[val_end:].copy()
+
+    # fit scalers on train only
     engineer.fit_scalers(train_df)
     train_scaled = engineer.transform_features(train_df)
     val_scaled = engineer.transform_features(val_df)
     test_scaled = engineer.transform_features(test_df)
-    
+
     return train_scaled, val_scaled, test_scaled
 
 
-def train_all_models_with_sentiment(train_df, val_df, test_df, engineer, symbol):
-    """
-    Train all models with sentiment-enhanced features
-    """
-    feature_cols = [col for col in train_df.columns if col != 'Target']
-    print(f"\n✓ Training with {len(feature_cols)} features (including sentiment)")
-    
-    # Check if sentiment features are included
-    sentiment_features = [col for col in feature_cols if 'Sentiment' in col or 'Article' in col]
-    if sentiment_features:
-        print(f"  Sentiment features detected: {sentiment_features}")
-    
-    all_predictions = {}
-    all_metrics = {}
-    
-    # Prepare data
-    X_train = train_df[feature_cols]
-    y_train = train_df['Target']
-    X_val = val_df[feature_cols]
-    y_val = val_df['Target']
-    X_test = test_df[feature_cols]
-    y_test = test_df['Target']
-    
-    # 1. Linear Regression
-    print(f"\n{'='*60}")
-    print("Training Linear Regression with Sentiment")
-    print(f"{'='*60}")
-    
+def train_models(train_df, val_df, test_df, engineer, symbol: str):
+    feature_cols = [c for c in train_df.columns if c != "Target"]
+    print(f"Training with {len(feature_cols)} features")
+
+    results = {}
+    predictions = {}
+
+    # 1. ARIMA on original (unscaled) target series: use raw train/test (inverse transform target from scaled)
+    print("\n=== TRAIN ARIMA ===")
+    try:
+        # arima expects original-scale series; get raw train/test from engineer.inverse (we need train/test before scaling)
+        # For safety, reconstruct original target series using inverse transform
+        y_train_orig = engineer.inverse_transform_target(train_df["Target"].values)
+        y_test_orig = engineer.inverse_transform_target(test_df["Target"].values)
+
+        arima = ARIMAPredictor()
+        arima.fit(y_train_orig)
+        arima_preds = arima.predict(len(y_test_orig))
+        # normalize arima preds to scaled target space
+        arima_preds_norm = engineer.target_scaler.transform(arima_preds.reshape(-1, 1)).flatten()
+        predictions["ARIMA"] = arima_preds_norm
+        # compute metrics on original scale
+        from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+        mse = mean_squared_error(y_test_orig, arima_preds)
+        rmse = np.sqrt(mse)
+        mae = mean_absolute_error(y_test_orig, arima_preds)
+        r2 = r2_score(y_test_orig, arima_preds)
+        results["ARIMA"] = {"MSE": mse, "RMSE": rmse, "MAE": mae, "R2": r2, "MAPE": np.mean(np.abs((y_test_orig - arima_preds) / y_test_orig)) * 100}
+        # Save arima model
+        import pickle
+        os.makedirs(os.path.join(SAVED_DIR, "arima_models"), exist_ok=True)
+        with open(os.path.join(SAVED_DIR, f"{symbol}_arima.pkl"), "wb") as f:
+            pickle.dump(arima.model_fit, f)
+        print("✓ ARIMA done")
+    except Exception as e:
+        print(f"ARIMA failed: {e}")
+
+    # 2. Linear Regression (on scaled features)
+    print("\n=== TRAIN LR ===")
     lr = LinearPredictor()
     lr.feature_cols = feature_cols
-    lr.train(X_train, y_train)
-    
-    lr_metrics, lr_preds = evaluate_model_on_original_scale(
-        lr, X_test, y_test, engineer, "Linear Regression"
-    )
-    all_metrics['Linear_Regression'] = lr_metrics
-    all_predictions['Linear_Regression'] = lr_preds
-    
-    lr.save_model(f'models/saved_models/lr_sentiment_{symbol}.pkl')
-    
-    # 2. LSTM
-    print(f"\n{'='*60}")
-    print("Training LSTM with Sentiment")
-    print(f"{'='*60}")
-    
-    lstm = LSTMPredictor(
-        sequence_length=10,
-        units=50,
-        layers=2,
-        dropout=0.2,
-        n_features=len(feature_cols)
-    )
-    
+    lr.train(train_df[feature_cols], train_df["Target"])
+    lr_preds_norm = lr.predict(test_df[feature_cols])
+    predictions["Linear_Regression"] = lr_preds_norm
+    lr_metrics, lr_preds_orig = evaluate_model_on_original_scale(lr, test_df[feature_cols], test_df["Target"], engineer, "Linear Regression")
+    results["Linear_Regression"] = lr_metrics
+    # save
+    import pickle
+    with open(os.path.join(SAVED_DIR, f"lr_sentiment_{symbol}.pkl"), "wb") as f:
+        pickle.dump(lr.model, f)
+
+    # 3. LSTM (use scaled data sequences)
+    print("\n=== TRAIN LSTM ===")
+    seq_len = 10
+    lstm = LSTMPredictor(sequence_length=seq_len, units=50, layers=2, dropout=0.2, n_features=len(feature_cols))
     X_train_seq, y_train_seq = lstm.prepare_sequences(train_df, feature_cols)
     X_val_seq, y_val_seq = lstm.prepare_sequences(val_df, feature_cols)
     X_test_seq, y_test_seq = lstm.prepare_sequences(test_df, feature_cols)
-    
-    lstm.train(
-        X_train_seq, y_train_seq,
-        X_val_seq, y_val_seq,
-        epochs=50,
-        batch_size=32,
-        model_path=f'models/saved_models/lstm_sentiment_{symbol}.h5'
-    )
-    
-    lstm_metrics, lstm_preds = evaluate_model_on_original_scale(
-        lstm, X_test_seq, y_test_seq, engineer, "LSTM"
-    )
-    all_metrics['LSTM'] = lstm_metrics
-    all_predictions['LSTM'] = lstm_preds
-    
-    # 3. LightGBM
-    print(f"\n{'='*60}")
-    print("Training LightGBM with Sentiment")
-    print(f"{'='*60}")
-    
+    lstm.build_model()
+    lstm.train(X_train_seq, y_train_seq, X_val_seq, y_val_seq, epochs=50, batch_size=32, model_path=os.path.join(SAVED_DIR, f"lstm_sentiment_{symbol}.h5"))
+    lstm_metrics, lstm_preds_norm = lstm.evaluate(X_test_seq, y_test_seq)
+    # lstm_preds_norm are normalized (scaled) target predictions
+    predictions["LSTM"] = lstm_preds_norm
+    results["LSTM"] = lstm_metrics
+
+    # 4. LightGBM
+    print("\n=== TRAIN LightGBM ===")
     lgbm = LightGBMPredictor()
-    lgbm.train(X_train, y_train, X_val, y_val, 
-               num_boost_round=500, early_stopping_rounds=50)
-    
-    lgbm_metrics, lgbm_preds = evaluate_model_on_original_scale(
-        lgbm, X_test, y_test, engineer, "LightGBM"
-    )
-    all_metrics['LightGBM'] = lgbm_metrics
-    all_predictions['LightGBM'] = lgbm_preds
-    
-    lgbm.save_model(f'models/saved_models/lgbm_sentiment_{symbol}.pkl')
-    
-    return all_metrics, all_predictions
+    lgbm.train(train_df[feature_cols], train_df["Target"], val_df[feature_cols], val_df["Target"], num_boost_round=500, early_stopping_rounds=50)
+    lgbm_preds_norm = lgbm.predict(test_df[feature_cols])
+    predictions["LightGBM"] = lgbm_preds_norm
+    lgbm_metrics, lgbm_preds_orig = evaluate_model_on_original_scale(lgbm, test_df[feature_cols], test_df["Target"], engineer, "LightGBM")
+    results["LightGBM"] = lgbm_metrics
+    lgbm.save_model(os.path.join(SAVED_DIR, f"lgbm_sentiment_{symbol}.pkl"))
+
+    # --------------------
+    # Align predictions lengths:
+    # LSTM predictions length = len(test_df) - seq_len
+    # For fair comparison, drop first seq_len rows from other model predictions & test target.
+    # --------------------
+    min_len = None
+    for k, preds in predictions.items():
+        if min_len is None or len(preds) < min_len:
+            min_len = len(preds)
+    # min_len should be len(lstm_preds) typically
+    print(f"Aligning all model preds to length = {min_len}")
+
+    aligned_preds = {}
+    for k, preds in predictions.items():
+        aligned_preds[k] = preds[-min_len:]
+
+    # Align y_test (scaled) by trimming the beginning seq_len rows so it matches LSTM
+    y_test_scaled = test_df["Target"].values
+    y_test_aligned_scaled = y_test_scaled[-min_len:]
+
+    # inverse transform y_test for ensemble training metrics
+    y_test_aligned_orig = engineer.inverse_transform_target(y_test_aligned_scaled)
+
+    # Convert all preds to original scale for ensemble training (ensemble expects original-scale targets)
+    preds_orig = {}
+    for k, preds_scaled in aligned_preds.items():
+        # preds may already be in scaled space or original depending on model; our convention:
+        # - LR, LGBM, LSTM: outputs are scaled (because trained on scaled Target)
+        # - ARIMA: we stored normalized (arima_preds_norm) when adding to predictions dict
+        try:
+            preds_orig[k] = engineer.inverse_transform_target(preds_scaled)
+        except Exception:
+            # fallback if already original
+            import numpy as _np
+            preds_orig[k] = _np.array(preds_scaled)
+
+    # TRAIN ENSEMBLE meta-learner on aligned preds
+    print("\n=== TRAIN ENSEMBLE (with sentiment) ===")
+    ensemble = EnsemblePredictor(meta_model_type="ridge")
+    meta_X = {k: v for k, v in preds_orig.items()}
+    # Ensemble class expects dict of base model preds and y_true (original)
+    holdout_metrics, holdout_preds = ensemble.train_and_evaluate(meta_X, y_test_aligned_orig, holdout_ratio=0.3, random_state=42)
+    ensemble.save_model(os.path.join(SAVED_DIR, f"ensemble_sentiment_{symbol}.pkl"))
+
+    # Compute and store final comparison DataFrame
+    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+    all_metrics = {}
+    for name, arr in preds_orig.items():
+        y_pred = arr[-min_len:]
+        y_true = y_test_aligned_orig
+        mse = mean_squared_error(y_true, y_pred)
+        rmse = mse ** 0.5
+        mae = mean_absolute_error(y_true, y_pred)
+        r2 = r2_score(y_true, y_pred)
+        mask = y_true != 0
+        mape = (np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100) if mask.sum() > 0 else np.nan
+        all_metrics[name] = {"MSE": mse, "RMSE": rmse, "MAE": mae, "R2": r2, "MAPE": mape}
+
+    # ensemble metrics
+    en_preds = holdout_preds
+    mse = mean_squared_error(y_test_aligned_orig, en_preds)
+    rmse = mse ** 0.5
+    mae = mean_absolute_error(y_test_aligned_orig, en_preds)
+    r2 = r2_score(y_test_aligned_orig, en_preds)
+    mask = y_test_aligned_orig != 0
+    mape = (np.mean(np.abs((y_test_aligned_orig[mask] - en_preds[mask]) / y_test_aligned_orig[mask])) * 100) if mask.sum() > 0 else np.nan
+    all_metrics["Ensemble"] = {"MSE": mse, "RMSE": rmse, "MAE": mae, "R2": r2, "MAPE": mape}
+
+    # Save results
+    comp_df = pd.DataFrame(all_metrics).T.round(4).sort_values("RMSE")
+    comp_df.to_csv(f"results/{symbol}_sentiment_comparison.csv")
+    print(f"✓ Saved comparison to results/{symbol}_sentiment_comparison.csv")
+
+    return results, preds_orig, comp_df
 
 
 def evaluate_model_on_original_scale(model, X_test, y_test, engineer, model_name):
-    """Helper to evaluate model and convert to original scale"""
+    """
+    Accepts either sklearn/lightgbm model or custom model with evaluate()
+    Returns metrics (on original scale) and original-scale predictions.
+    """
     from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-    
-    # Get predictions
-    if hasattr(model, 'evaluate'):
-        _, predictions_norm = model.evaluate(X_test, y_test)
+
+    if hasattr(model, "evaluate"):
+        _, preds_scaled = model.evaluate(X_test, y_test)
     else:
-        predictions_norm = model.predict(X_test)
-    
-    # Convert to original scale
-    predictions_original = engineer.inverse_transform_target(predictions_norm)
+        preds_scaled = model.predict(X_test)
+
+    preds_orig = engineer.inverse_transform_target(preds_scaled)
     if isinstance(y_test, pd.Series):
-        y_test_original = engineer.inverse_transform_target(y_test.values)
+        y_true_orig = engineer.inverse_transform_target(y_test.values)
     else:
-        y_test_original = engineer.inverse_transform_target(y_test)
-    
-    # Calculate metrics
-    mse = mean_squared_error(y_test_original, predictions_original)
-    rmse = np.sqrt(mse)
-    mae = mean_absolute_error(y_test_original, predictions_original)
-    r2 = r2_score(y_test_original, predictions_original)
-    
-    mask = y_test_original != 0
-    if mask.sum() > 0:
-        mape = np.mean(np.abs((y_test_original[mask] - predictions_original[mask]) / y_test_original[mask])) * 100
-    else:
-        mape = np.nan
-    
-    metrics = {
-        'MSE': mse,
-        'RMSE': rmse,
-        'MAE': mae,
-        'R2': r2,
-        'MAPE': mape
-    }
-    
-    print(f"\n✓ {model_name} Performance:")
-    print(f"  RMSE: {rmse:.4f} | MAE: {mae:.4f} | R²: {r2:.4f} | MAPE: {mape:.2f}%")
-    
-    return metrics, predictions_original
+        y_true_orig = engineer.inverse_transform_target(y_test)
+
+    mse = mean_squared_error(y_true_orig, preds_orig)
+    rmse = mse ** 0.5
+    mae = mean_absolute_error(y_true_orig, preds_orig)
+    r2 = r2_score(y_true_orig, preds_orig)
+    mask = y_true_orig != 0
+    mape = (np.mean(np.abs((y_true_orig[mask] - preds_orig[mask]) / y_true_orig[mask])) * 100) if mask.sum() > 0 else np.nan
+
+    metrics = {"MSE": mse, "RMSE": rmse, "MAE": mae, "R2": r2, "MAPE": mape}
+    print(f"\n✓ {model_name} performance (original scale): RMSE {rmse:.4f}, MAE {mae:.4f}, R2 {r2:.4f}")
+    return metrics, preds_orig
 
 
-def compare_with_without_sentiment(symbol):
-    """
-    Compare model performance with and without sentiment
-    """
-    print(f"\n{'='*80}")
-    print("COMPARING MODELS: WITH vs WITHOUT SENTIMENT")
-    print(f"{'='*80}")
-    
-    # Load results WITHOUT sentiment
-    results_without_path = f'results/{symbol}_model_comparison.csv'
-    if not os.path.exists(results_without_path):
-        print(f"\n⚠️  No baseline results found at {results_without_path}")
-        print("   Run: python train_all_models.py --symbol {symbol} first")
-        return None
-    
-    results_without = pd.read_csv(results_without_path, index_col=0)
-    
-    # Load results WITH sentiment
-    results_with_path = f'results/{symbol}_sentiment_comparison.csv'
-    if not os.path.exists(results_with_path):
-        print(f"⚠️  No sentiment results found")
-        return None
-    
-    results_with = pd.read_csv(results_with_path, index_col=0)
-    
-    # Compare
-    print("\n" + "="*80)
-    print("WITHOUT SENTIMENT:")
-    print("="*80)
-    print(results_without)
-    
-    print("\n" + "="*80)
-    print("WITH SENTIMENT:")
-    print("="*80)
-    print(results_with)
-    
-    # Calculate improvement
-    print("\n" + "="*80)
-    print("IMPROVEMENT (%) - Negative = Better Performance")
-    print("="*80)
-    
-    improvement = pd.DataFrame()
-    for metric in ['RMSE', 'MAE', 'MAPE']:
-        if metric in results_with.columns and metric in results_without.columns:
-            improvement[metric] = ((results_with[metric] - results_without[metric]) / 
-                                  results_without[metric] * 100)
-    
-    print(improvement)
-    
-    # Save comparison
-    comparison_path = f'results/{symbol}_sentiment_impact.csv'
-    improvement.to_csv(comparison_path)
-    print(f"\n✓ Comparison saved to {comparison_path}")
-    
-    return improvement
-
-
-def main(symbol='AAPL', api_key=None, period='2y'):
-    """
-    Main training pipeline WITH sentiment analysis
-    """
-    start_time = datetime.now()
-    
-    print(f"\n{'#'*80}")
-    print(f"# TRAINING WITH SENTIMENT ANALYSIS")
-    print(f"# Symbol: {symbol}")
-    print(f"# Start: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{'#'*80}")
-    
-    try:
-        # Prepare data with sentiment
-        combined_df, engineer, has_sentiment = prepare_data_with_sentiment(
-            symbol, api_key, period
-        )
-        
-        if not has_sentiment:
-            print("\n⚠️  WARNING: Training WITHOUT sentiment features")
-            print("   To include sentiment, provide a valid NewsAPI key")
-        
-        # Split and normalize
-        train_df, val_df, test_df = split_and_normalize(
-            combined_df, engineer
-        )
-        
-        # Train models
-        all_metrics, all_predictions = train_all_models_with_sentiment(
-            train_df, val_df, test_df, engineer, symbol
-        )
-        
-        # Save results
-        results_df = pd.DataFrame(all_metrics).T.round(4)
-        results_path = f'results/{symbol}_sentiment_comparison.csv'
-        results_df.to_csv(results_path)
-        
-        print(f"\n{'='*80}")
-        print("FINAL RESULTS WITH SENTIMENT")
-        print(f"{'='*80}")
-        print(results_df)
-        print(f"\n✓ Results saved to {results_path}")
-        
-        # Compare with baseline
-        if has_sentiment:
-            improvement = compare_with_without_sentiment(symbol)
-        
-        # Calculate duration
-        duration = (datetime.now() - start_time).total_seconds()
-        
-        print(f"\n{'#'*80}")
-        print(f"# TRAINING COMPLETE")
-        print(f"# Duration: {duration:.2f}s ({duration/60:.2f}min)")
-        print(f"{'#'*80}\n")
-        
-        return results_df
-        
-    except Exception as e:
-        print(f"\n❌ ERROR: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+def main(symbol="AAPL", api_key=None, period="2y"):
+    start = datetime.now()
+    combined, engineer, has_sentiment = prepare_data_with_sentiment(symbol, api_key, period)
+    train_df, val_df, test_df = split_and_scale(combined, engineer)
+    results, preds, comp_df = train_models(train_df, val_df, test_df, engineer, symbol)
+    duration = (datetime.now() - start).total_seconds()
+    print(f"Total time: {duration:.2f}s")
+    return results, preds, comp_df
 
 
 if __name__ == "__main__":
     import argparse
-    
-    parser = argparse.ArgumentParser(
-        description='Train models WITH sentiment analysis'
-    )
-    parser.add_argument(
-        '--symbol', type=str, default='AAPL',
-        help='Stock symbol (e.g., AAPL, TSLA, GOOGL)'
-    )
-    parser.add_argument(
-        '--api-key', type=str,
-        help='NewsAPI key (get from https://newsapi.org/)'
-    )
-    parser.add_argument(
-        '--period', type=str, default='2y',
-        help='Time period (1y, 2y, 5y, max)'
-    )
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--symbol", type=str, default="AAPL")
+    parser.add_argument("--api-key", type=str, help="Alpha Vantage API key")
+    parser.add_argument("--period", type=str, default="2y")
     args = parser.parse_args()
-    
-    # Set API key in environment if provided
     if args.api_key:
-        os.environ['NEWS_API_KEY'] = args.api_key
-    
-    results = main(
-        symbol=args.symbol.upper(),
-        api_key=args.api_key,
-        period=args.period
-    )
+        os.environ["ALPHA_VANTAGE_API_KEY"] = args.api_key
+    main(symbol=args.symbol.upper(), api_key=args.api_key, period=args.period)
